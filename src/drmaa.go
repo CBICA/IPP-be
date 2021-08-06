@@ -156,7 +156,7 @@ func fetch_experiment(experiment Experiment) Job {
 		log.Fatalln(err)
 	}
 
-	data, err := ioutil.ReadFile("../config/" + experiment.App + ".json")
+	data, err := ioutil.ReadFile("../IPP-Experiment_Defintions/" + experiment.App + ".json")
 	if err != nil {
 		log.Fatalln(err)
 	}
