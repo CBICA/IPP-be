@@ -20,6 +20,7 @@ import (
 
 var DRMAA_DATABASE = "testdb.db"
 var API_URL = "http://localhost:3330"
+var EXPERIMENT_DIR = "./outputs"
 
 type App struct {
 	Executable      string
@@ -31,9 +32,10 @@ type App struct {
 }
 
 type Job struct {
-	Command   string
-	Args      []string
-	Container string
+	Command          string
+	Args             []string
+	Container        string
+	WorkingDirectory string
 }
 
 type Experiment struct {
@@ -108,21 +110,24 @@ func Unzip(src, dest string) error {
 	return nil
 }
 
-func run_job(job Job) {
-	sm, err := drmaa2os.NewDockerSessionManager(DRMAA_DATABASE)
-	if err != nil {
-		panic(err)
-	}
+func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2interface.JobState) {
 
 	js, err := sm.CreateJobSession("jobsession", "")
 	if err != nil {
+		fmt.Println("uh oh, delete", DRMAA_DATABASE, "and try again")
 		panic(err)
 	}
 
+	cwd, _ := os.Getwd()
+
 	jt := drmaa2interface.JobTemplate{
-		RemoteCommand: job.Command,
-		Args:          job.Args,
-		JobCategory:   job.Container,
+		RemoteCommand:    job.Command,
+		Args:             job.Args,
+		JobCategory:      job.Container,
+		WorkingDirectory: job.WorkingDirectory,
+	}
+	jt.StageInFiles = map[string]string{
+		cwd: cwd,
 	}
 	jr, err := js.RunJob(jt)
 	if err != nil {
@@ -130,6 +135,8 @@ func run_job(job Job) {
 	}
 
 	jr.WaitTerminated(drmaa2interface.InfiniteTime)
+
+	exit_status <- jr.GetState()
 
 	js.Close()
 	sm.DestroyJobSession("jobsession")
@@ -143,7 +150,8 @@ func fetch_experiment(experiment Experiment) Job {
 		log.Fatalln(err)
 	}
 	defer resp.Body.Close()
-	out, err := os.Create(eid + ".zip")
+	zipfile := eid + ".zip"
+	out, err := os.Create(zipfile)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -152,9 +160,11 @@ func fetch_experiment(experiment Experiment) Job {
 		log.Fatalln(err)
 	}
 	// unzip fetched files
-	if err := Unzip(eid+".zip", eid); err != nil {
+	if err := Unzip(zipfile, "inputs"); err != nil {
 		log.Fatalln(err)
 	}
+	// delete zip
+	os.Remove(zipfile)
 
 	data, err := ioutil.ReadFile("../IPP-Experiment_Defintions/" + experiment.App + ".json")
 	if err != nil {
@@ -163,29 +173,61 @@ func fetch_experiment(experiment Experiment) Job {
 	var app App
 	json.Unmarshal([]byte(data), &app)
 
+	unused_defaults := app.Defaults
+	experdir := filepath.Join(EXPERIMENT_DIR, eid)
 	// args := []string{app.Executable}
 	args := []string{}
 	for k, v := range experiment.Params {
+		delete(unused_defaults, k) // just try deleting since removing a non-existent entry is a no-op
 		if v == "" {
 			v = app.Defaults[k]
 		}
-		// if v starts with /var/uploads/
-		if strings.HasPrefix(v, "/var/uploads/") {
-			v = filepath.Join(eid, v)
+		if strings.HasPrefix(v, "$experdir") {
+			v = filepath.Join(experdir, v[len("$experdir"):])
 		}
+
 		if _, ok := app.Params[k]; ok {
 			args = append(args, app.Params[k]+" "+v)
 		} else { // it must be in binopts
 			args = append(args, app.Binopts[k])
 		}
 	}
+	for k, v := range unused_defaults {
+		if strings.HasPrefix(v, "$experdir") {
+			v = filepath.Join(experdir, v[len("$experdir"):])
+		}
+		args = append(args, app.Params[k]+" "+v)
+	}
 	// fmt.Println(strings.Join(args, " "))
+	executable := " "
+	if app.Container == "" {
+		executable = app.Executable
+	}
 	ret := Job{
-		Command:   app.Executable,
-		Args:      args,
-		Container: app.Container,
+		Command:          executable,
+		Args:             args,
+		Container:        app.Container,
+		WorkingDirectory: experdir,
 	}
 	return ret
+
+}
+
+func push_results(eid int, uid int) {
+	fmt.Println("Uploading", eid)
+	// post results
+	// resp, err := http.Post(API_URL+"/experiments/"+strconv.Itoa(eid)+"/results", "application/json", nil)
+	// if err != nil {
+	// 	log.Fatalln(err)
+	// }
+	// defer resp.Body.Close()
+	// if resp.StatusCode != 200 {
+	// 	log.Fatalln("Error uploading results")
+	// }
+	// delete files
+	// if err := os.RemoveAll(filepath.Join("inputs", strconv.Itoa(eid))); err != nil {
+	// 	log.Fatalln(err)
+	// }
 
 }
 
@@ -204,9 +246,35 @@ func main() {
 
 	for _, experiment := range queue {
 
-		// fetch_experiment(experiment)
-		// fmt.Println(fetch_experiment(experiment))
-		run_job(fetch_experiment(experiment))
+		job := fetch_experiment(experiment)
+		exit_status := make(chan drmaa2interface.JobState)
+		switch experiment.Host {
+		case "localhost":
+			fmt.Println(job)
+			sm, err := drmaa2os.NewDockerSessionManager(DRMAA_DATABASE)
+			if err != nil {
+				panic(err)
+			}
+			go run_job(job, sm, exit_status)
+		case "cubic":
+			fmt.Println(job)
+			sm, err := drmaa2os.NewLibDRMAASessionManager(DRMAA_DATABASE)
+			if err != nil {
+				panic(err)
+			}
+			go run_job(job, sm, exit_status)
+		default:
+			log.Fatalln("unknown host:", experiment.Host)
+		}
+
+		result := <-exit_status
+		switch result {
+		case drmaa2interface.Failed:
+			fmt.Println("Failed to execute job successfully")
+		case drmaa2interface.Done:
+			fmt.Println("Completed successfully")
+			push_results(experiment.Id, experiment.User)
+		}
 
 	}
 }
