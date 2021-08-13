@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"github.com/dgruber/drmaa2interface"
 	"github.com/dgruber/drmaa2os"
 	_ "github.com/dgruber/drmaa2os/pkg/jobtracker/dockertracker"
+	"github.com/mholt/archiver/v3"
 )
 
 var DRMAA_DATABASE = "testdb.db"
@@ -46,70 +46,6 @@ type Experiment struct {
 	Params map[string]string
 }
 
-func Unzip(src, dest string) error {
-	r, err := zip.OpenReader(src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := r.Close(); err != nil {
-			panic(err)
-		}
-	}()
-
-	os.MkdirAll(dest, 0755)
-
-	// Closure to address file descriptors issue with all the deferred .Close() methods
-	extractAndWriteFile := func(f *zip.File) error {
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := rc.Close(); err != nil {
-				panic(err)
-			}
-		}()
-
-		path := filepath.Join(dest, f.Name)
-
-		// Check for ZipSlip (Directory traversal)
-		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("illegal file path: %s", path)
-		}
-
-		if f.FileInfo().IsDir() {
-			os.MkdirAll(path, 0755)
-		} else {
-			os.MkdirAll(filepath.Dir(path), 0755)
-			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-			if err != nil {
-				return err
-			}
-			defer func() {
-				if err := f.Close(); err != nil {
-					panic(err)
-				}
-			}()
-
-			_, err = io.Copy(f, rc)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	for _, f := range r.File {
-		err := extractAndWriteFile(f)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2interface.JobState) {
 
 	js, err := sm.CreateJobSession("jobsession", "")
@@ -118,17 +54,19 @@ func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2
 		panic(err)
 	}
 
-	cwd, _ := os.Getwd()
-
 	jt := drmaa2interface.JobTemplate{
 		RemoteCommand:    job.Command,
 		Args:             job.Args,
 		JobCategory:      job.Container,
 		WorkingDirectory: job.WorkingDirectory,
 	}
+	// working dir is experiment dir, 2 levels up includes inputs and outputs
+	root := filepath.Dir(filepath.Dir(job.WorkingDirectory))
+	fmt.Println("wd", root)
 	jt.StageInFiles = map[string]string{
-		cwd: cwd,
+		root: root,
 	}
+	fmt.Println(jt)
 	jr, err := js.RunJob(jt)
 	if err != nil {
 		panic(err)
@@ -160,7 +98,8 @@ func fetch_experiment(experiment Experiment) Job {
 		log.Fatalln(err)
 	}
 	// unzip fetched files
-	if err := Unzip(zipfile, "inputs"); err != nil {
+	input_dir := filepath.Join("inputs", eid)
+	if err := archiver.Unarchive(zipfile, input_dir); err != nil {
 		log.Fatalln(err)
 	}
 	// delete zip
@@ -174,7 +113,7 @@ func fetch_experiment(experiment Experiment) Job {
 	json.Unmarshal([]byte(data), &app)
 
 	unused_defaults := app.Defaults
-	experdir := filepath.Join(EXPERIMENT_DIR, eid)
+	experdir, _ := filepath.Abs(filepath.Join(EXPERIMENT_DIR, eid))
 	// args := []string{app.Executable}
 	args := []string{}
 	for k, v := range experiment.Params {
@@ -184,6 +123,9 @@ func fetch_experiment(experiment Experiment) Job {
 		}
 		if strings.HasPrefix(v, "$experdir") {
 			v = filepath.Join(experdir, v[len("$experdir"):])
+		} else if strings.HasPrefix(v, "./inputs") {
+			v, _ = filepath.Abs(
+				filepath.Join("inputs", eid, v[len("./inputs"):]))
 		}
 
 		if _, ok := app.Params[k]; ok {
@@ -215,20 +157,25 @@ func fetch_experiment(experiment Experiment) Job {
 
 func push_results(eid int, uid int) {
 	fmt.Println("Uploading", eid)
-	// post results
-	// resp, err := http.Post(API_URL+"/experiments/"+strconv.Itoa(eid)+"/results", "application/json", nil)
+	// zip results dir
+	experdir, _ := filepath.Abs(filepath.Join(EXPERIMENT_DIR, strconv.Itoa(eid)))
+	zipfile := strconv.Itoa(eid) + ".zip"
+	// todo could stream files into an archive that is being written to HTTP response w/o writing disk
+	// see: https://github.com/mholt/archiver#library-use
+	if err := archiver.Archive([]string{experdir}, zipfile); err != nil {
+		log.Fatalln(err)
+	}
+	// upload zip
+	// resp, err := http.Post(API_URL+"/experiments/"+strconv.Itoa(eid)+"/results", "application/zip",
+	// 	bytes.NewReader([]byte(zipfile)))
 	// if err != nil {
 	// 	log.Fatalln(err)
 	// }
 	// defer resp.Body.Close()
-	// if resp.StatusCode != 200 {
-	// 	log.Fatalln("Error uploading results")
-	// }
-	// delete files
-	// if err := os.RemoveAll(filepath.Join("inputs", strconv.Itoa(eid))); err != nil {
-	// 	log.Fatalln(err)
-	// }
-
+	// delete zip
+	// os.Remove(zipfile)
+	// delete results dir
+	// os.RemoveAll(experdir)
 }
 
 func main() {

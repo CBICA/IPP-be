@@ -1,3 +1,5 @@
 *.db
 old/
 .DS_Store
+src/inputs
+src/outputs
