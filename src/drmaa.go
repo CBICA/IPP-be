@@ -15,6 +15,7 @@ import (
 	"github.com/dgruber/drmaa2interface"
 	"github.com/dgruber/drmaa2os"
 	_ "github.com/dgruber/drmaa2os/pkg/jobtracker/dockertracker"
+	"github.com/go-resty/resty/v2"
 	"github.com/mholt/archiver/v3"
 )
 
@@ -156,7 +157,6 @@ func fetch_experiment(experiment Experiment) Job {
 }
 
 func push_results(eid int, uid int) {
-	fmt.Println("Uploading", eid)
 	// zip results dir
 	experdir, _ := filepath.Abs(filepath.Join(EXPERIMENT_DIR, strconv.Itoa(eid)))
 	zipfile := strconv.Itoa(eid) + ".zip"
@@ -166,16 +166,17 @@ func push_results(eid int, uid int) {
 		log.Fatalln(err)
 	}
 	// upload zip
-	// resp, err := http.Post(API_URL+"/experiments/"+strconv.Itoa(eid)+"/results", "application/zip",
-	// 	bytes.NewReader([]byte(zipfile)))
-	// if err != nil {
-	// 	log.Fatalln(err)
-	// }
-	// defer resp.Body.Close()
-	// delete zip
-	// os.Remove(zipfile)
-	// delete results dir
-	// os.RemoveAll(experdir)
+	client := resty.New()
+	resp, err := client.R().
+		SetFile("results", zipfile).
+		Post(API_URL + "/experiments/" + strconv.Itoa(eid) + "/results")
+	fmt.Println(resp)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	os.Remove(zipfile)
+	os.RemoveAll(experdir)
 }
 
 func main() {
