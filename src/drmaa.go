@@ -11,17 +11,25 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dgruber/drmaa2interface"
 	"github.com/dgruber/drmaa2os"
 	_ "github.com/dgruber/drmaa2os/pkg/jobtracker/dockertracker"
+	"github.com/elliotchance/sshtunnel"
 	"github.com/go-resty/resty/v2"
 	"github.com/mholt/archiver/v3"
+	"golang.org/x/crypto/ssh"
 )
 
-var DRMAA_DATABASE = "testdb.db"
-var API_URL = "http://localhost:3330"
-var EXPERIMENT_DIR = "./outputs"
+var (
+	DRMAA_DATABASE = "testdb.db"
+	API_URL        = "http://localhost:5000"
+	EXPERIMENT_DIR = "./outputs"
+	SSH_ADDR       = "root@localhost"
+	REMOTE_ADDR    = "localhost:5000"
+	LOCAL_PORT     = "5000"
+)
 
 type App struct {
 	Executable      string
@@ -180,6 +188,35 @@ func push_results(eid int, uid int) {
 }
 
 func main() {
+	// Setup the tunnel, but do not yet start it yet.
+	tunnel := sshtunnel.NewSSHTunnel(
+		// User and host of tunnel server, it will default to port 22
+		// if not specified.
+		SSH_ADDR,
+
+		// Pick ONE of the following authentication methods:
+		// sshtunnel.PrivateKeyFile("path/to/private/key.pem"), // 1. private key
+		ssh.Password("root"), // 2. password
+		// sshtunnel.SSHAgent(),                                // 3. ssh-agent
+
+		// The destination host and port of the actual server.
+		REMOTE_ADDR,
+
+		// The local port you want to bind the remote port to.
+		// Specifying "0" will lead to a random port.
+		LOCAL_PORT,
+	)
+
+	// You can provide a logger for debugging, or remove this line to
+	// make it silent.
+	tunnel.Log = log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
+
+	// Start the server in the background. You will need to wait a
+	// small amount of time for it to bind to the localhost port
+	// before you can start sending connections.
+	go tunnel.Start()
+	time.Sleep(100 * time.Millisecond)
+
 	resp, err := http.Get(API_URL + "/experiments/queue")
 	if err != nil {
 		log.Fatalln(err)
