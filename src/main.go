@@ -24,11 +24,11 @@ import (
 
 var (
 	DRMAA_DATABASE = "testdb.db"
-	API_URL        = "http://localhost:5000"
-	EXPERIMENT_DIR = "./outputs"
-	SSH_ADDR       = "root@localhost"
-	REMOTE_ADDR    = "localhost:5000"
-	LOCAL_PORT     = "5000"
+	OUTPUT_DIR     = "outputs"
+	INPUT_DIR      = "inputs"         // note this must match what's hardcoded in the API server
+	SSH_ADDR       = "root@localhost" // ssh login for machine the API server's running on
+	REMOTE_ADDR    = "localhost:5000" // address API server is running on (when ssh'd in)
+	LOCAL_PORT     = "0"              // make the remote address available through any (random) local port
 )
 
 type App struct {
@@ -68,10 +68,12 @@ func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2
 		Args:             job.Args,
 		JobCategory:      job.Container,
 		WorkingDirectory: job.WorkingDirectory,
+		OutputPath:       filepath.Join(job.WorkingDirectory, "output.txt"),
+		JoinFiles:        true,
 	}
 	// working dir is experiment dir, 2 levels up includes inputs and outputs
 	root := filepath.Dir(filepath.Dir(job.WorkingDirectory))
-	fmt.Println("wd", root)
+
 	jt.StageInFiles = map[string]string{
 		root: root,
 	}
@@ -89,10 +91,10 @@ func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2
 	sm.DestroyJobSession("jobsession")
 }
 
-func fetch_experiment(experiment Experiment) Job {
+func fetch_experiment(experiment Experiment, apiUrl string) Job {
 	// fetch files for experiment
 	eid := strconv.Itoa(experiment.Id)
-	resp, err := http.Get(API_URL + "/experiments/" + eid + "/files")
+	resp, err := http.Get(apiUrl + "/" + eid + "/files")
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -107,7 +109,7 @@ func fetch_experiment(experiment Experiment) Job {
 		log.Fatalln(err)
 	}
 	// unzip fetched files
-	input_dir := filepath.Join("inputs", eid)
+	input_dir := filepath.Join(INPUT_DIR, eid)
 	if err := archiver.Unarchive(zipfile, input_dir); err != nil {
 		log.Fatalln(err)
 	}
@@ -122,7 +124,7 @@ func fetch_experiment(experiment Experiment) Job {
 	json.Unmarshal([]byte(data), &app)
 
 	unused_defaults := app.Defaults
-	experdir, _ := filepath.Abs(filepath.Join(EXPERIMENT_DIR, eid))
+	experdir, _ := filepath.Abs(filepath.Join(OUTPUT_DIR, eid))
 	// args := []string{app.Executable}
 	args := []string{}
 	for k, v := range experiment.Params {
@@ -132,9 +134,9 @@ func fetch_experiment(experiment Experiment) Job {
 		}
 		if strings.HasPrefix(v, "$experdir") {
 			v = filepath.Join(experdir, v[len("$experdir"):])
-		} else if strings.HasPrefix(v, "./inputs") {
+		} else if strings.HasPrefix(v, INPUT_DIR) {
 			v, _ = filepath.Abs(
-				filepath.Join("inputs", eid, v[len("./inputs"):]))
+				filepath.Join(INPUT_DIR, eid, v[len(INPUT_DIR):]))
 		}
 
 		if _, ok := app.Params[k]; ok {
@@ -164,9 +166,9 @@ func fetch_experiment(experiment Experiment) Job {
 
 }
 
-func push_results(eid int, uid int) {
+func push_results(eid int, uid int, apiUrl string) {
 	// zip results dir
-	experdir, _ := filepath.Abs(filepath.Join(EXPERIMENT_DIR, strconv.Itoa(eid)))
+	experdir, _ := filepath.Abs(filepath.Join(OUTPUT_DIR, strconv.Itoa(eid)))
 	zipfile := strconv.Itoa(eid) + ".zip"
 	// todo could stream files into an archive that is being written to HTTP response w/o writing disk
 	// see: https://github.com/mholt/archiver#library-use
@@ -177,7 +179,7 @@ func push_results(eid int, uid int) {
 	client := resty.New()
 	resp, err := client.R().
 		SetFile("results", zipfile).
-		Post(API_URL + "/experiments/" + strconv.Itoa(eid) + "/results")
+		Post(apiUrl + "/" + strconv.Itoa(eid) + "/results")
 	fmt.Println(resp)
 	if err != nil {
 		log.Fatalln(err)
@@ -185,6 +187,27 @@ func push_results(eid int, uid int) {
 
 	os.Remove(zipfile)
 	os.RemoveAll(experdir)
+}
+
+func delete_inputs(eid int, apiUrl string) {
+	client := resty.New()
+	_, err := client.R().
+		Delete(apiUrl + "/" + strconv.Itoa(eid) + "/delete")
+	if err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func mark_failed(eid int, exit_code drmaa2interface.JobState, apiUrl string) {
+	client := resty.New()
+	_, err := client.R().
+		SetFormData(map[string]string{
+			"exit_code": exit_code.String(),
+		}).
+		Post(apiUrl + "/" + strconv.Itoa(eid) + "/failed")
+	if err != nil {
+		log.Fatalln(err)
+	}
 }
 
 func main() {
@@ -217,7 +240,10 @@ func main() {
 	go tunnel.Start()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get(API_URL + "/experiments/queue")
+	apiUrl := "http://localhost:" + strconv.Itoa(tunnel.Local.Port) + "/experiments"
+
+	// fetch experiments from queue
+	resp, err := http.Get(apiUrl + "/queue")
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -231,9 +257,13 @@ func main() {
 
 	for _, experiment := range queue {
 
-		job := fetch_experiment(experiment)
+		// fetch files for each experiment
+		job := fetch_experiment(experiment, apiUrl)
+		// create channel to get exit code when job finishes
 		exit_status := make(chan drmaa2interface.JobState)
 		switch experiment.Host {
+		// in reality everything is run on localhost, but these are the labels on the frontend
+		// since it might be confusing to put "DRMAA" when someone's trying to run on CUBIC
 		case "localhost":
 			fmt.Println(job)
 			sm, err := drmaa2os.NewDockerSessionManager(DRMAA_DATABASE)
@@ -256,9 +286,11 @@ func main() {
 		switch result {
 		case drmaa2interface.Failed:
 			fmt.Println("Failed to execute job successfully")
+			mark_failed(experiment.Id, result, apiUrl)
 		case drmaa2interface.Done:
 			fmt.Println("Completed successfully")
-			push_results(experiment.Id, experiment.User)
+			delete_inputs(experiment.Id, apiUrl)
+			push_results(experiment.Id, experiment.User, apiUrl)
 		}
 
 	}
