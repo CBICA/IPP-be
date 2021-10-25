@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,6 +17,7 @@ import (
 	"github.com/dgruber/drmaa2interface"
 	"github.com/dgruber/drmaa2os"
 	_ "github.com/dgruber/drmaa2os/pkg/jobtracker/dockertracker"
+	"github.com/dgruber/drmaa2os/pkg/jobtracker/libdrmaa"
 	"github.com/elliotchance/sshtunnel"
 	"github.com/go-resty/resty/v2"
 	"github.com/mholt/archiver/v3"
@@ -23,12 +25,11 @@ import (
 )
 
 var (
-	DRMAA_DATABASE = "testdb.db"
-	OUTPUT_DIR     = "outputs"
-	INPUT_DIR      = "inputs"         // note this must match what's hardcoded in the API server
-	SSH_ADDR       = "root@localhost" // ssh login for machine the API server's running on
-	REMOTE_ADDR    = "localhost:5000" // address API server is running on (when ssh'd in)
-	LOCAL_PORT     = "0"              // make the remote address available through any (random) local port
+	OUTPUT_DIR  = "outputs"
+	INPUT_DIR   = "inputs"                    // note this must match what's hardcoded in the API server
+	SSH_ADDR    = "root@host.docker.internal" // ssh login for machine the API server's running on
+	REMOTE_ADDR = "localhost:5000"            // address API server is running on (when ssh'd in)
+	LOCAL_PORT  = "0"                         // make the remote address available through any (random) local port
 )
 
 type App struct {
@@ -55,13 +56,11 @@ type Experiment struct {
 	Params map[string]string
 }
 
-func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2interface.JobState) {
+type ExperimentJobs struct {
+	Map map[string]Experiment // maps job id to experiment
+}
 
-	js, err := sm.CreateJobSession("jobsession", "")
-	if err != nil {
-		fmt.Println("uh oh, delete", DRMAA_DATABASE, "and try again")
-		panic(err)
-	}
+func run_job(job Job, sm drmaa2interface.SessionManager, js drmaa2interface.JobSession) drmaa2interface.Job {
 
 	jt := drmaa2interface.JobTemplate{
 		RemoteCommand:    job.Command,
@@ -70,6 +69,7 @@ func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2
 		WorkingDirectory: job.WorkingDirectory,
 		OutputPath:       filepath.Join(job.WorkingDirectory, "output.txt"),
 		JoinFiles:        true,
+		// NativeSpecification: job.SGEJobResources,
 	}
 	// working dir is experiment dir, 2 levels up includes inputs and outputs
 	root := filepath.Dir(filepath.Dir(job.WorkingDirectory))
@@ -77,21 +77,35 @@ func run_job(job Job, sm drmaa2interface.SessionManager, exit_status chan drmaa2
 	jt.StageInFiles = map[string]string{
 		root: root,
 	}
-	fmt.Println(jt)
+
+	os.Mkdir(job.WorkingDirectory, 0755)
 	jr, err := js.RunJob(jt)
 	if err != nil {
 		panic(err)
 	}
 
-	jr.WaitTerminated(drmaa2interface.InfiniteTime)
+	return jr
 
-	exit_status <- jr.GetState()
-
-	js.Close()
-	sm.DestroyJobSession("jobsession")
 }
 
-func fetch_experiment(experiment Experiment, apiUrl string) Job {
+func fetch_queue(apiUrl string, sm drmaa2interface.SessionManager, js drmaa2interface.JobSession) []Experiment {
+	// fetch experiments from queue
+	var queue []Experiment
+	resp, err := http.Get(apiUrl + "/queue")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	json.Unmarshal([]byte(body), &queue)
+
+	return queue
+}
+
+func fetch_experiment(apiUrl string, experiment Experiment) Job {
 	// fetch files for experiment
 	eid := strconv.Itoa(experiment.Id)
 	resp, err := http.Get(apiUrl + "/" + eid + "/files")
@@ -210,7 +224,7 @@ func mark_failed(eid int, exit_code drmaa2interface.JobState, apiUrl string) {
 	}
 }
 
-func main() {
+func setup_tunnel() (*sshtunnel.SSHTunnel, string) {
 	// Setup the tunnel, but do not yet start it yet.
 	tunnel := sshtunnel.NewSSHTunnel(
 		// User and host of tunnel server, it will default to port 22
@@ -240,58 +254,121 @@ func main() {
 	go tunnel.Start()
 	time.Sleep(100 * time.Millisecond)
 
-	apiUrl := "http://localhost:" + strconv.Itoa(tunnel.Local.Port) + "/experiments"
+	return tunnel, "http://localhost:" + strconv.Itoa(tunnel.Local.Port) + "/experiments"
+}
 
-	// fetch experiments from queue
-	resp, err := http.Get(apiUrl + "/queue")
-	if err != nil {
-		log.Fatalln(err)
-	}
+func main() {
+	backend := flag.String("backend", "libdrmaa", "backend type") // choices: libdrmaa, docker
+	contactString := flag.String("contact", "", "contact string") // see https://github.com/dgruber/drmaa2os/issues/24
+	submit := flag.Bool("submit", false, "submit jobs")
+	status := flag.Bool("status", false, "status jobs")
+	flag.Parse()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	var queue []Experiment
-	json.Unmarshal([]byte(body), &queue)
-
-	for _, experiment := range queue {
-
-		// fetch files for each experiment
-		job := fetch_experiment(experiment, apiUrl)
-		// create channel to get exit code when job finishes
-		exit_status := make(chan drmaa2interface.JobState)
-		switch experiment.Host {
-		// in reality everything is run on localhost, but these are the labels on the frontend
-		// since it might be confusing to put "DRMAA" when someone's trying to run on CUBIC
-		case "localhost":
-			fmt.Println(job)
-			sm, err := drmaa2os.NewDockerSessionManager(DRMAA_DATABASE)
-			if err != nil {
-				panic(err)
-			}
-			go run_job(job, sm, exit_status)
-		case "cubic":
-			fmt.Println(job)
-			sm, err := drmaa2os.NewLibDRMAASessionManager(DRMAA_DATABASE)
-			if err != nil {
-				panic(err)
-			}
-			go run_job(job, sm, exit_status)
-		default:
-			log.Fatalln("unknown host:", experiment.Host)
+	// setup drmaa session
+	var sm drmaa2interface.SessionManager
+	switch *backend {
+	case "docker":
+		sm, _ = drmaa2os.NewDockerSessionManager("docker.db")
+	case "libdrmaa":
+		params := libdrmaa.LibDRMAASessionParams{
+			ContactString:           "",
+			UsePersistentJobStorage: true,
+			DBFilePath:              "libdrmaajobs.db",
 		}
-
-		result := <-exit_status
-		switch result {
-		case drmaa2interface.Failed:
-			fmt.Println("Failed to execute job successfully")
-			mark_failed(experiment.Id, result, apiUrl)
-		case drmaa2interface.Done:
-			fmt.Println("Completed successfully")
-			delete_inputs(experiment.Id, apiUrl)
-			push_results(experiment.Id, experiment.User, apiUrl)
-		}
-
+		sm, _ = drmaa2os.NewLibDRMAASessionManagerWithParams(params, "libdrmaa.db")
+	default:
+		log.Fatalln("invalid backend")
 	}
+
+	js, err := sm.CreateJobSession("jobsession", *contactString)
+	if err != nil {
+		js, err = sm.OpenJobSession("jobsession")
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		contact, err := js.GetContact()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("session has contact string %s\n", contact)
+	}
+	defer js.Close()
+
+	// setup ssh tunnel
+	tunnel, apiUrl := setup_tunnel()
+
+	// check if we previously submitted jobs
+	var submitted ExperimentJobs
+	dat, err := os.ReadFile("jobs.json")
+	if err == nil {
+		json.Unmarshal(dat, &submitted)
+	} else {
+		submitted.Map = make(map[string]Experiment)
+	}
+	if *status {
+		// check if there are any jobs currently running
+		filter := drmaa2interface.CreateJobInfo()
+		existingJobs, err := js.GetJobs(filter)
+		if err != nil {
+			fmt.Printf("could not list jobs: %v\n", err)
+		}
+		for job, exp := range submitted.Map {
+			found := false
+			for _, existingJob := range existingJobs {
+				if job == existingJob.GetID() {
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Println("Job completed")
+				fmt.Println(job)
+				delete(submitted.Map, job)
+				delete_inputs(exp.Id, apiUrl)
+				push_results(exp.Id, exp.User, apiUrl)
+			}
+		}
+	}
+	// switch state {
+	// case drmaa2interface.Failed:
+	// 	fmt.Println("Failed to execute job successfully")
+	// 	tunnel.Start()
+	// 	fmt.Println("Re opening tunnel")
+	// 	mark_failed(experiment.Id, state, apiUrl)
+	// 	tunnel.Close()
+	// 	fmt.Println("Closing tunnel")
+	// case drmaa2interface.Done:
+	// 	fmt.Println("Completed successfully")
+	// 	tunnel.Start()
+	// 	fmt.Println("Re opening tunnel")
+	// 	delete_inputs(experiment.Id, apiUrl)
+	// 	push_results(experiment.Id, experiment.User, apiUrl)
+	// 	tunnel.Close()
+	// 	fmt.Println("Closing tunnel")
+	// }
+
+	if *submit {
+		// fetch new jobs
+		queue := fetch_queue(apiUrl, sm, js)
+		for _, experiment := range queue {
+
+			// fetch files for each experiment
+			job := fetch_experiment(apiUrl, experiment)
+
+			fmt.Println(job)
+			submitted_job := run_job(job, sm, js)
+			// write to json
+			submitted.Map[submitted_job.GetID()] = experiment
+			// write to file
+			json_data, _ := json.Marshal(submitted)
+			ioutil.WriteFile("jobs.json", json_data, 0644)
+
+		}
+	}
+
+	tunnel.Close()
+	js.Close()
+	sm.DestroyJobSession("jobsession")
+
 }

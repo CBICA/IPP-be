@@ -17,4 +17,4 @@ In production, `go build` can be used to create an optimized binary; refer to th
 cd src
 go build -o /path/to/optimized/binary
 ```
-Note that `root@localhost` is hardcoded as the SSH login for the API server, and `localhost:5000` is hardcoded as the address of the API web server, running within the SSH host; these can be adjusted at the top of `./src/main.go`.
+Note that `root@localhost` is hardcoded as the SSH login for the API server, and `localhost:5000` is hardcoded as the address of the API web server, running within the SSH host; these can be adjusted at the top of `main.go`.
